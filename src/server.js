@@ -1,3 +1,5 @@
+// src/server.js - FIX PER RAILWAY
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -18,15 +20,21 @@ const io = new Server(server, {
   maxHttpBufferSize: 1e8
 });
 
-// ... resto del codice invariato ...
+// ... (tutto il codice RoomManager, API, Socket.io invariato) ...
 
 // ============================================================
-// START - CORRETTO PER RAILWAY
+// START - FIX: usa solo process.env.PORT, bind 0.0.0.0
 // ============================================================
 
-const PORT = process.env.PORT || 3000;
+// Railway assegna PORT automaticamente, deve essere usata esattamente
+const PORT = process.env.PORT;
 
-// IMPORTANTE: '0.0.0.0' per accettare connessioni esterne
+if (!PORT) {
+  console.error('ERROR: PORT environment variable not set');
+  process.exit(1);
+}
+
+// '0.0.0.0' = accetta connessioni da qualsiasi IP (necessario per container)
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔══════════════════════════════════════════╗
