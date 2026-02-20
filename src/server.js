@@ -2,34 +2,27 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
 
-// Middleware
 app.use(cors({ origin: "*" }));
-app.use(express.json({ limit: '500mb' }));
-app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
-app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 1000 }));
+app.use(express.json({ limit: '1gb' }));
 
-// Socket.IO
 const io = new Server(server, {
     cors: { origin: "*" },
     transports: ['websocket', 'polling'],
-    pingTimeout: 60000,
-    pingInterval: 25000,
-    maxHttpBufferSize: 5e8
+    maxHttpBufferSize: 1e9
 });
 
-// Room Manager
+// Room Manager professionale
 class RoomManager {
     constructor() {
-        this.rooms = new Map();
-        this.userToRoom = new Map();
-        this.destructionTimeouts = new Map();
+        this.rooms = new Map();              // roomId -> room
+        this.clientToRoom = new Map();       // clientId -> roomId
+        this.socketToClient = new Map();     // socketId -> clientId
+        this.destructionTimeouts = new Map(); // roomId -> timeout
     }
 
     createRoom(socketId, clientId) {
@@ -38,15 +31,21 @@ class RoomManager {
             id: roomId,
             hostId: socketId,
             hostClientId: clientId,
-            guests: new Map(),
+            guests: new Map(), // socketId -> clientId
             fileInfo: null,
-            relayActive: false,
-            createdAt: Date.now(),
-            lastActivity: Date.now()
+            transferState: {
+                active: false,
+                chunkIndex: 0,
+                totalChunks: 0,
+                fileId: null
+            },
+            createdAt: Date.now()
         };
+        
         this.rooms.set(roomId, room);
-        this.userToRoom.set(socketId, roomId);
-        console.log(`[ROOM] ✅ ${roomId} creata da Host (Client: ${clientId})`);
+        this.clientToRoom.set(clientId, roomId);
+        this.socketToClient.set(socketId, clientId);
+        console.log(`[ROOM] ✅ ${roomId} creata da host ${clientId}`);
         return room;
     }
 
@@ -54,16 +53,115 @@ class RoomManager {
         const room = this.rooms.get(roomId);
         if (!room) return { error: 'NOT_FOUND' };
         if (room.guests.size >= 10) return { error: 'FULL' };
+        
         room.guests.set(socketId, clientId);
-        this.userToRoom.set(socketId, roomId);
-        room.lastActivity = Date.now();
+        this.clientToRoom.set(clientId, roomId);
+        this.socketToClient.set(socketId, clientId);
         return room;
     }
 
-    getRoom(id) { return this.rooms.get(id); }
-    getRoomByUser(socketId) {
-        const id = this.userToRoom.get(socketId);
-        return id ? this.rooms.get(id) : null;
+    // Host che si riconnette
+    rejoinHost(clientId, socketId) {
+        const roomId = this.clientToRoom.get(clientId);
+        if (!roomId) return null;
+        
+        const room = this.rooms.get(roomId);
+        if (!room) return null;
+        
+        // Annulla timer distruzione
+        if (this.destructionTimeouts.has(roomId)) {
+            clearTimeout(this.destructionTimeouts.get(roomId));
+            this.destructionTimeouts.delete(roomId);
+        }
+        
+        // Aggiorna socketId
+        this.socketToClient.delete(room.hostId);
+        room.hostId = socketId;
+        this.socketToClient.set(socketId, clientId);
+        
+        return room;
+    }
+
+    // Guest che si riconnette
+    rejoinGuest(clientId, socketId) {
+        const roomId = this.clientToRoom.get(clientId);
+        if (!roomId) return null;
+        
+        const room = this.rooms.get(roomId);
+        if (!room) return null;
+        
+        // Rimuovi vecchio socket
+        for (let [oldSocket, oldClient] of room.guests.entries()) {
+            if (oldClient === clientId) {
+                room.guests.delete(oldSocket);
+                this.socketToClient.delete(oldSocket);
+                break;
+            }
+        }
+        
+        // Aggiungi nuovo
+        room.guests.set(socketId, clientId);
+        this.socketToClient.set(socketId, clientId);
+        
+        return room;
+    }
+
+    // Avvia timer distruzione (host away)
+    startDestructionTimer(roomId) {
+        if (this.destructionTimeouts.has(roomId)) return;
+        
+        const timeout = setTimeout(() => {
+            const room = this.rooms.get(roomId);
+            if (room) {
+                console.log(`[ROOM] 💥 Stanza ${roomId} distrutta (timeout host)`);
+                io.to(roomId).emit('host-disconnected');
+                
+                // Pulizia
+                this.clientToRoom.delete(room.hostClientId);
+                room.guests.forEach((clientId, socketId) => {
+                    this.clientToRoom.delete(clientId);
+                    this.socketToClient.delete(socketId);
+                });
+                this.rooms.delete(roomId);
+                this.destructionTimeouts.delete(roomId);
+            }
+        }, 60000); // 60 secondi di tolleranza
+        
+        this.destructionTimeouts.set(roomId, timeout);
+    }
+
+    getRoomBySocket(socketId) {
+        const clientId = this.socketToClient.get(socketId);
+        if (!clientId) return null;
+        const roomId = this.clientToRoom.get(clientId);
+        return roomId ? this.rooms.get(roomId) : null;
+    }
+
+    removeSocket(socketId) {
+        const clientId = this.socketToClient.get(socketId);
+        if (!clientId) return null;
+        
+        const roomId = this.clientToRoom.get(clientId);
+        if (!roomId) return null;
+        
+        const room = this.rooms.get(roomId);
+        if (!room) return null;
+        
+        // Se è l'host
+        if (room.hostId === socketId) {
+            this.startDestructionTimer(roomId);
+            return { isHost: true, roomId, guests: Array.from(room.guests.keys()) };
+        }
+        
+        // Se è un guest
+        if (room.guests.has(socketId)) {
+            room.guests.delete(socketId);
+            this.clientToRoom.delete(clientId);
+            this.socketToClient.delete(socketId);
+            return { isHost: false, roomId, hostId: room.hostId, leaver: socketId };
+        }
+        
+        return null;
     }
 
     generateCode() {
@@ -71,172 +169,174 @@ class RoomManager {
         let code;
         do {
             code = '';
-            for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+            for (let i = 0; i < 6; i++) {
+                code += chars[Math.floor(Math.random() * chars.length)];
+            }
         } while (this.rooms.has(code));
         return code;
-    }
-
-    startDestructionTimer(roomId, ioServer) {
-        if (this.destructionTimeouts.has(roomId)) return;
-        console.log(`[ROOM] ⏳ Avvio timer distruzione per ${roomId} (Host disconnesso)`);
-        const timeout = setTimeout(() => {
-            const room = this.rooms.get(roomId);
-            if (room) {
-                console.log(`[ROOM] 💥 Stanza ${roomId} distrutta per timeout host`);
-                ioServer.to(roomId).emit('host-disconnected');
-                this.userToRoom.delete(room.hostId);
-                for (let guestSocketId of room.guests.keys()) this.userToRoom.delete(guestSocketId);
-                this.rooms.delete(roomId);
-                this.destructionTimeouts.delete(roomId);
-            }
-        }, 45000);
-        this.destructionTimeouts.set(roomId, timeout);
-    }
-
-    cancelDestructionTimer(roomId) {
-        if (this.destructionTimeouts.has(roomId)) {
-            clearTimeout(this.destructionTimeouts.get(roomId));
-            this.destructionTimeouts.delete(roomId);
-            console.log(`[ROOM] 🛑 Timer distruzione annullato per ${roomId} (Host tornato)`);
-        }
     }
 }
 
 const rooms = new RoomManager();
 
-// Relay Manager
-class RelayManager {
-    constructor() { this.relaySessions = new Map(); }
-    createSession(roomId, senderId, metadata) {
-        const session = { roomId, senderId, metadata, chunks: [], recipients: new Set(), startTime: Date.now(), lastActivity: Date.now(), completed: false };
-        this.relaySessions.set(roomId, session);
-        return session;
-    }
-    addChunk(roomId, index, chunk) {
-        const session = this.relaySessions.get(roomId);
-        if (session) { session.chunks[index] = chunk; session.lastActivity = Date.now(); return session; }
-        return null;
-    }
-    getSession(roomId) { return this.relaySessions.get(roomId); }
-    addRecipient(roomId, recipientId) { const session = this.relaySessions.get(roomId); if (session) { session.recipients.add(recipientId); session.lastActivity = Date.now(); } }
-    completeSession(roomId) {
-        const session = this.relaySessions.get(roomId);
-        if (session) { session.completed = true; setTimeout(() => { this.relaySessions.delete(roomId); }, 5 * 60 * 1000); }
-    }
-    abortSession(roomId, reason) { this.relaySessions.delete(roomId); }
-}
-const relayManager = new RelayManager();
-
 // API
-app.get('/', (req, res) => res.json({ status: 'ok', rooms: rooms.rooms.size, uptime: process.uptime() }));
-app.get('/turn-credentials', (req, res) => {
-    res.json({ iceServers: [ { urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' } ] });
+app.get('/', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        rooms: rooms.rooms.size,
+        uptime: process.uptime() 
+    });
 });
 
-// Socket.IO events
+app.get('/turn-credentials', (req, res) => {
+    res.json({
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            {
+                urls: 'turn:openrelay.metered.ca:443',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            }
+        ]
+    });
+});
+
+// Socket.io
 io.on('connection', (socket) => {
     const clientId = socket.handshake.query.clientId;
-    console.log(`[CONNECT] 🔌 Socket: ${socket.id} | ClientID: ${clientId}`);
+    console.log(`[CONNECT] 🔌 ${socket.id} | client:${clientId}`);
 
+    // --- CREAZIONE STANZA ---
     socket.on('create-room', (cb) => {
         const room = rooms.createRoom(socket.id, clientId);
         socket.join(room.id);
-        cb({ success: true, roomId: room.id, isHost: true });
+        cb({ success: true, roomId: room.id });
     });
 
+    // --- JOIN STANZA ---
     socket.on('join-room', (roomId, cb) => {
         const result = rooms.joinRoom(roomId, socket.id, clientId);
-        if (result.error) return cb({ success: false, error: result.error });
-        socket.join(roomId);
-        socket.to(result.hostId).emit('guest-joined', { guestId: socket.id, count: result.guests.size });
-        cb({ success: true, roomId, hostId: result.hostId, fileInfo: result.fileInfo, isHost: false });
-    });
-
-    socket.on('restore-session', ({ roomId, isHost }, cb) => {
-        const room = rooms.getRoom(roomId);
-        if (!room) return cb?.({ success: false, error: 'Stanza distrutta' });
-
-        if (isHost && room.hostClientId === clientId) {
-            rooms.cancelDestructionTimer(roomId);
-            rooms.userToRoom.delete(room.hostId);
-            room.hostId = socket.id;
-            rooms.userToRoom.set(socket.id, roomId);
-            socket.join(roomId);
-            socket.to(roomId).emit('host-back');
-            console.log(`[RECOVERY] ♻️ Host ripristinato nella stanza ${roomId}`);
-
-            // Invia all'host la lista dei guest attuali
-            const guestList = Array.from(room.guests.keys());
-            socket.emit('host-restored', { guests: guestList });
-
-            cb?.({ success: true });
-        } else if (!isHost) {
-            socket.join(roomId);
-            rooms.userToRoom.set(socket.id, roomId);
-            room.guests.set(socket.id, clientId);
-            socket.to(room.hostId).emit('guest-joined', { guestId: socket.id, count: room.guests.size });
-            cb?.({ success: true });
+        if (result.error) {
+            return cb({ success: false, error: result.error });
         }
+        socket.join(roomId);
+        
+        // Notifica host
+        socket.to(result.hostId).emit('guest-joined', {
+            guestId: socket.id,
+            count: result.guests.size
+        });
+        
+        cb({
+            success: true,
+            roomId,
+            hostId: result.hostId,
+            fileInfo: result.fileInfo
+        });
     });
 
-    socket.on('host-going-away', ({ roomId }) => { socket.to(roomId).emit('host-away'); });
-    socket.on('host-returned', ({ roomId }) => { socket.to(roomId).emit('host-back'); });
+    // --- HOST REJOIN (dopo file picker) ---
+    socket.on('host-rejoin', ({ roomId }, cb) => {
+        const room = rooms.rejoinHost(clientId, socket.id);
+        if (!room) {
+            return cb({ success: false, error: 'Stanza non trovata' });
+        }
+        
+        socket.join(roomId);
+        
+        // Invia lista guest attuali all'host
+        const guestList = Array.from(room.guests.keys());
+        socket.emit('host-restored', { guests: guestList });
+        
+        // Notifica ai guest che l'host è tornato
+        socket.to(roomId).emit('host-back');
+        
+        cb({ success: true, fileInfo: room.fileInfo });
+    });
 
+    // --- GUEST REJOIN (opzionale, se anche guest si riconnette) ---
+    socket.on('guest-rejoin', ({ roomId }, cb) => {
+        const room = rooms.rejoinGuest(clientId, socket.id);
+        if (!room) {
+            return cb({ success: false, error: 'Stanza non trovata' });
+        }
+        
+        socket.join(roomId);
+        socket.to(room.hostId).emit('guest-joined', {
+            guestId: socket.id,
+            count: room.guests.size
+        });
+        
+        cb({ success: true, hostId: room.hostId, fileInfo: room.fileInfo });
+    });
+
+    // --- FILE INFO ---
     socket.on('file-info', (info, cb) => {
-        const room = rooms.getRoomByUser(socket.id);
-        if (!room || room.hostId !== socket.id) return cb?.({ error: 'NOT_HOST' });
+        const room = rooms.getRoomBySocket(socket.id);
+        if (!room || room.hostId !== socket.id) {
+            return cb?.({ error: 'NOT_HOST' });
+        }
+        
         room.fileInfo = info;
         socket.to(room.id).emit('file-available', info);
         cb?.({ success: true });
     });
 
-    socket.on('guest-ready', (target) => {
-        const room = rooms.getRoomByUser(socket.id);
+    // --- TRASFERIMENTO STATO (per riprendere da chunk interrotto) ---
+    socket.on('transfer-state', (state, cb) => {
+        const room = rooms.getRoomBySocket(socket.id);
+        if (!room || room.hostId !== socket.id) return;
+        
+        room.transferState = state;
+        cb?.({ success: true });
+    });
+
+    // --- GUEST READY ---
+    socket.on('guest-ready', () => {
+        const room = rooms.getRoomBySocket(socket.id);
         if (!room) return;
-        socket.to(target || room.hostId).emit('guest-ready', { guestId: socket.id });
+        socket.to(room.hostId).emit('guest-ready', { guestId: socket.id });
     });
 
-    socket.on('signal', ({ to, type, data }) => socket.to(to).emit('signal', { from: socket.id, type, data }));
-
-    socket.on('relay-start', ({ roomId, metadata }, cb) => {
-        const room = rooms.getRoom(roomId);
-        if (!room || room.hostId !== socket.id) return cb?.({ error: 'NOT_HOST' });
-        relayManager.createSession(roomId, socket.id, metadata);
-        room.relayActive = true;
-        socket.to(roomId).emit('relay-ready', metadata);
-        cb?.({ success: true, totalChunks: metadata.totalChunks });
+    // --- SIGNALING ---
+    socket.on('signal', ({ to, type, data }) => {
+        socket.to(to).emit('signal', { from: socket.id, type, data });
     });
 
+    // --- RELAY CHUNK ---
     socket.on('relay-chunk', ({ roomId, chunk, index, total, isLast }) => {
-        const session = relayManager.getSession(roomId);
-        if (!session || session.senderId !== socket.id) return;
-        relayManager.addChunk(roomId, index, chunk);
-        socket.to(roomId).emit('relay-chunk', { from: socket.id, chunk, index, total, isLast });
-        if (isLast) { relayManager.completeSession(roomId); const room = rooms.getRoom(roomId); if (room) room.relayActive = false; }
+        socket.to(roomId).emit('relay-chunk', {
+            from: socket.id,
+            chunk,
+            index,
+            total,
+            isLast
+        });
     });
 
-    socket.on('relay-ack', ({ roomId, index }) => {
-        const session = relayManager.getSession(roomId);
-        if (session) io.to(session.senderId).emit('relay-ack', { from: socket.id, index });
-    });
-
+    // --- DISCONNECT ---
     socket.on('disconnect', () => {
-        console.log(`[DISCONNECT] ❌ ${socket.id} (Client: ${clientId})`);
-        const room = rooms.getRoomByUser(socket.id);
-        if (!room) return;
-
-        if (room.hostId === socket.id) {
-            socket.to(room.id).emit('host-away');
-            rooms.startDestructionTimer(room.id, io);
+        console.log(`[DISCONNECT] ❌ ${socket.id}`);
+        
+        const result = rooms.removeSocket(socket.id);
+        if (!result) return;
+        
+        if (result.isHost) {
+            // Host disconnesso: avvisa guest
+            io.to(result.roomId).emit('host-away');
+            console.log(`[ROOM] ⏳ Host away stanza ${result.roomId}`);
         } else {
-            room.guests.delete(socket.id);
-            rooms.userToRoom.delete(socket.id);
-            io.to(room.hostId).emit('guest-left', { guestId: socket.id, remaining: room.guests.size });
+            // Guest disconnesso
+            io.to(result.hostId).emit('guest-left', {
+                guestId: result.leaver,
+                remaining: rooms.rooms.get(result.roomId)?.guests.size || 0
+            });
         }
     });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[SERVER] 🎬 P2P CINEMA - Server in ascolto sulla porta ${PORT}`);
+    console.log(`[SERVER] 🚀 P2P Cinema - Porta ${PORT}`);
 });
