@@ -16,13 +16,12 @@ const io = new Server(server, {
     maxHttpBufferSize: 1e9
 });
 
-// Room Manager professionale
 class RoomManager {
     constructor() {
-        this.rooms = new Map();              // roomId -> room
-        this.clientToRoom = new Map();       // clientId -> roomId
-        this.socketToClient = new Map();     // socketId -> clientId
-        this.destructionTimeouts = new Map(); // roomId -> timeout
+        this.rooms = new Map();
+        this.clientToRoom = new Map();
+        this.socketToClient = new Map();
+        this.destructionTimeouts = new Map();
     }
 
     createRoom(socketId, clientId) {
@@ -31,17 +30,11 @@ class RoomManager {
             id: roomId,
             hostId: socketId,
             hostClientId: clientId,
-            guests: new Map(), // socketId -> clientId
+            guests: new Map(),
             fileInfo: null,
-            transferState: {
-                active: false,
-                chunkIndex: 0,
-                totalChunks: 0,
-                fileId: null
-            },
+            transferState: { active: false, chunkIndex: 0, totalChunks: 0, fileId: null },
             createdAt: Date.now()
         };
-        
         this.rooms.set(roomId, room);
         this.clientToRoom.set(clientId, roomId);
         this.socketToClient.set(socketId, clientId);
@@ -53,44 +46,32 @@ class RoomManager {
         const room = this.rooms.get(roomId);
         if (!room) return { error: 'NOT_FOUND' };
         if (room.guests.size >= 10) return { error: 'FULL' };
-        
         room.guests.set(socketId, clientId);
         this.clientToRoom.set(clientId, roomId);
         this.socketToClient.set(socketId, clientId);
         return room;
     }
 
-    // Host che si riconnette
     rejoinHost(clientId, socketId) {
         const roomId = this.clientToRoom.get(clientId);
         if (!roomId) return null;
-        
         const room = this.rooms.get(roomId);
         if (!room) return null;
-        
-        // Annulla timer distruzione
         if (this.destructionTimeouts.has(roomId)) {
             clearTimeout(this.destructionTimeouts.get(roomId));
             this.destructionTimeouts.delete(roomId);
         }
-        
-        // Aggiorna socketId
         this.socketToClient.delete(room.hostId);
         room.hostId = socketId;
         this.socketToClient.set(socketId, clientId);
-        
         return room;
     }
 
-    // Guest che si riconnette
     rejoinGuest(clientId, socketId) {
         const roomId = this.clientToRoom.get(clientId);
         if (!roomId) return null;
-        
         const room = this.rooms.get(roomId);
         if (!room) return null;
-        
-        // Rimuovi vecchio socket
         for (let [oldSocket, oldClient] of room.guests.entries()) {
             if (oldClient === clientId) {
                 room.guests.delete(oldSocket);
@@ -98,25 +79,18 @@ class RoomManager {
                 break;
             }
         }
-        
-        // Aggiungi nuovo
         room.guests.set(socketId, clientId);
         this.socketToClient.set(socketId, clientId);
-        
         return room;
     }
 
-    // Avvia timer distruzione (host away)
     startDestructionTimer(roomId) {
         if (this.destructionTimeouts.has(roomId)) return;
-        
         const timeout = setTimeout(() => {
             const room = this.rooms.get(roomId);
             if (room) {
                 console.log(`[ROOM] 💥 Stanza ${roomId} distrutta (timeout host)`);
                 io.to(roomId).emit('host-disconnected');
-                
-                // Pulizia
                 this.clientToRoom.delete(room.hostClientId);
                 room.guests.forEach((clientId, socketId) => {
                     this.clientToRoom.delete(clientId);
@@ -125,8 +99,7 @@ class RoomManager {
                 this.rooms.delete(roomId);
                 this.destructionTimeouts.delete(roomId);
             }
-        }, 60000); // 60 secondi di tolleranza
-        
+        }, 60000);
         this.destructionTimeouts.set(roomId, timeout);
     }
 
@@ -140,27 +113,20 @@ class RoomManager {
     removeSocket(socketId) {
         const clientId = this.socketToClient.get(socketId);
         if (!clientId) return null;
-        
         const roomId = this.clientToRoom.get(clientId);
         if (!roomId) return null;
-        
         const room = this.rooms.get(roomId);
         if (!room) return null;
-        
-        // Se è l'host
         if (room.hostId === socketId) {
             this.startDestructionTimer(roomId);
             return { isHost: true, roomId, guests: Array.from(room.guests.keys()) };
         }
-        
-        // Se è un guest
         if (room.guests.has(socketId)) {
             room.guests.delete(socketId);
             this.clientToRoom.delete(clientId);
             this.socketToClient.delete(socketId);
             return { isHost: false, roomId, hostId: room.hostId, leaver: socketId };
         }
-        
         return null;
     }
 
@@ -169,9 +135,7 @@ class RoomManager {
         let code;
         do {
             code = '';
-            for (let i = 0; i < 6; i++) {
-                code += chars[Math.floor(Math.random() * chars.length)];
-            }
+            for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
         } while (this.rooms.has(code));
         return code;
     }
@@ -179,13 +143,8 @@ class RoomManager {
 
 const rooms = new RoomManager();
 
-// API
 app.get('/', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        rooms: rooms.rooms.size,
-        uptime: process.uptime() 
-    });
+    res.json({ status: 'ok', rooms: rooms.rooms.size, uptime: process.uptime() });
 });
 
 app.get('/turn-credentials', (req, res) => {
@@ -202,132 +161,123 @@ app.get('/turn-credentials', (req, res) => {
     });
 });
 
-// Socket.io
 io.on('connection', (socket) => {
     const clientId = socket.handshake.query.clientId;
     console.log(`[CONNECT] 🔌 ${socket.id} | client:${clientId}`);
 
-    // --- CREAZIONE STANZA ---
     socket.on('create-room', (cb) => {
         const room = rooms.createRoom(socket.id, clientId);
         socket.join(room.id);
         cb({ success: true, roomId: room.id });
     });
 
-    // --- JOIN STANZA ---
     socket.on('join-room', (roomId, cb) => {
         const result = rooms.joinRoom(roomId, socket.id, clientId);
-        if (result.error) {
-            return cb({ success: false, error: result.error });
-        }
+        if (result.error) return cb({ success: false, error: result.error });
         socket.join(roomId);
-        
-        // Notifica host
-        socket.to(result.hostId).emit('guest-joined', {
-            guestId: socket.id,
-            count: result.guests.size
-        });
-        
-        cb({
-            success: true,
-            roomId,
-            hostId: result.hostId,
-            fileInfo: result.fileInfo
-        });
+        socket.to(result.hostId).emit('guest-joined', { guestId: socket.id, count: result.guests.size });
+        cb({ success: true, roomId, hostId: result.hostId, fileInfo: result.fileInfo });
     });
 
-    // --- HOST REJOIN (dopo file picker) ---
     socket.on('host-rejoin', ({ roomId }, cb) => {
         const room = rooms.rejoinHost(clientId, socket.id);
-        if (!room) {
-            return cb({ success: false, error: 'Stanza non trovata' });
-        }
-        
+        if (!room) return cb({ success: false, error: 'Stanza non trovata' });
         socket.join(roomId);
-        
-        // Invia lista guest attuali all'host
         const guestList = Array.from(room.guests.keys());
         socket.emit('host-restored', { guests: guestList });
-        
-        // Notifica ai guest che l'host è tornato
         socket.to(roomId).emit('host-back');
-        
         cb({ success: true, fileInfo: room.fileInfo });
     });
 
-    // --- GUEST REJOIN (opzionale, se anche guest si riconnette) ---
     socket.on('guest-rejoin', ({ roomId }, cb) => {
         const room = rooms.rejoinGuest(clientId, socket.id);
-        if (!room) {
-            return cb({ success: false, error: 'Stanza non trovata' });
-        }
-        
+        if (!room) return cb({ success: false, error: 'Stanza non trovata' });
         socket.join(roomId);
-        socket.to(room.hostId).emit('guest-joined', {
-            guestId: socket.id,
-            count: room.guests.size
-        });
-        
+        socket.to(room.hostId).emit('guest-joined', { guestId: socket.id, count: room.guests.size });
         cb({ success: true, hostId: room.hostId, fileInfo: room.fileInfo });
     });
 
-    // --- FILE INFO ---
     socket.on('file-info', (info, cb) => {
         const room = rooms.getRoomBySocket(socket.id);
-        if (!room || room.hostId !== socket.id) {
-            return cb?.({ error: 'NOT_HOST' });
-        }
-        
+        if (!room || room.hostId !== socket.id) return cb?.({ error: 'NOT_HOST' });
         room.fileInfo = info;
         socket.to(room.id).emit('file-available', info);
         cb?.({ success: true });
     });
 
-    // --- TRASFERIMENTO STATO (per riprendere da chunk interrotto) ---
     socket.on('transfer-state', (state, cb) => {
         const room = rooms.getRoomBySocket(socket.id);
         if (!room || room.hostId !== socket.id) return;
-        
         room.transferState = state;
         cb?.({ success: true });
     });
 
-    // --- GUEST READY ---
     socket.on('guest-ready', () => {
         const room = rooms.getRoomBySocket(socket.id);
         if (!room) return;
         socket.to(room.hostId).emit('guest-ready', { guestId: socket.id });
     });
 
-    // --- SIGNALING ---
+    // ----------------------------------------------------------------
+    // PLAY / PAUSE - broadcast a tutta la stanza tranne il mittente
+    // ----------------------------------------------------------------
+    socket.on('play-command', ({ roomId, scheduledWallclock, sentAt, type }) => {
+        const room = rooms.getRoomBySocket(socket.id);
+        if (!room) return;
+        console.log(`[PLAY] ▶ stanza ${room.id} scheduledWallclock:${scheduledWallclock}`);
+        // Invia a tutti i guest (tutti i membri della room tranne l'host)
+        socket.to(room.id).emit('play-command', { scheduledWallclock, sentAt, type });
+    });
+
+    socket.on('pause-command', ({ roomId }) => {
+        const room = rooms.getRoomBySocket(socket.id);
+        if (!room) return;
+        console.log(`[PAUSE] ⏸ stanza ${room.id}`);
+        socket.to(room.id).emit('pause-command');
+    });
+
+    // ----------------------------------------------------------------
+    // GUEST -> HOST: audio sbloccato e file pronto
+    // ----------------------------------------------------------------
+    socket.on('guest-audio-unlocked', ({ roomId }) => {
+        const room = rooms.getRoomBySocket(socket.id);
+        if (!room) return;
+        console.log(`[AUDIO] 🔊 guest ${socket.id} audio unlocked in ${room.id}`);
+        socket.to(room.hostId).emit('guest-audio-unlocked', { guestId: socket.id });
+    });
+
+    socket.on('guest-ready-for-play', ({ roomId }) => {
+        const room = rooms.getRoomBySocket(socket.id);
+        if (!room) return;
+        console.log(`[READY] ✅ guest ${socket.id} pronto in ${room.id}`);
+        socket.to(room.hostId).emit('guest-ready-for-play', { guestId: socket.id });
+    });
+
+    // ----------------------------------------------------------------
+    // SIGNALING WebRTC (offer/answer/ice + play-command diretto)
+    // ----------------------------------------------------------------
     socket.on('signal', ({ to, type, data }) => {
         socket.to(to).emit('signal', { from: socket.id, type, data });
     });
 
-    // --- RELAY CHUNK ---
+    // ----------------------------------------------------------------
+    // RELAY CHUNK (fallback quando WebRTC non disponibile)
+    // ----------------------------------------------------------------
     socket.on('relay-chunk', ({ roomId, chunk, index, total, isLast }) => {
-        socket.to(roomId).emit('relay-chunk', {
-            from: socket.id,
-            chunk,
-            index,
-            total,
-            isLast
-        });
+        socket.to(roomId).emit('relay-chunk', { from: socket.id, chunk, index, total, isLast });
     });
 
-    // --- DISCONNECT ---
+    // ----------------------------------------------------------------
+    // DISCONNECT
+    // ----------------------------------------------------------------
     socket.on('disconnect', () => {
         console.log(`[DISCONNECT] ❌ ${socket.id}`);
-        
         const result = rooms.removeSocket(socket.id);
         if (!result) return;
-        
         if (result.isHost) {
-            // Host disconnesso: avvisa guest
             io.to(result.roomId).emit('host-away');
             console.log(`[ROOM] ⏳ Host away stanza ${result.roomId}`);
         } else {
-            // Guest disconnesso
             io.to(result.hostId).emit('guest-left', {
                 guestId: result.leaver,
                 remaining: rooms.rooms.get(result.roomId)?.guests.size || 0
