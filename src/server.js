@@ -9,24 +9,13 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
-// ============================================================
-// MIDDLEWARE
-// ============================================================
+// Middleware
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: '500mb' }));
-app.use(helmet({
-    crossOriginResourcePolicy: { policy: "cross-origin" }
-}));
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
+app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 1000 }));
 
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 1000
-});
-app.use('/api/', limiter);
-
-// ============================================================
-// SOCKET.IO CONFIGURAZIONE
-// ============================================================
+// Socket.IO
 const io = new Server(server, {
     cors: { origin: "*" },
     transports: ['websocket', 'polling'],
@@ -35,14 +24,12 @@ const io = new Server(server, {
     maxHttpBufferSize: 5e8
 });
 
-// ============================================================
-// ROOM MANAGER (Aggiornato per tolleranza disconnessioni)
-// ============================================================
+// Room Manager
 class RoomManager {
     constructor() {
         this.rooms = new Map();
         this.userToRoom = new Map();
-        this.destructionTimeouts = new Map(); // Gestione Grace Period
+        this.destructionTimeouts = new Map();
     }
 
     createRoom(socketId, clientId) {
@@ -51,13 +38,12 @@ class RoomManager {
             id: roomId,
             hostId: socketId,
             hostClientId: clientId,
-            guests: new Map(), // socketId -> clientId
+            guests: new Map(),
             fileInfo: null,
             relayActive: false,
             createdAt: Date.now(),
             lastActivity: Date.now()
         };
-        
         this.rooms.set(roomId, room);
         this.userToRoom.set(socketId, roomId);
         console.log(`[ROOM] ✅ ${roomId} creata da Host (Client: ${clientId})`);
@@ -68,18 +54,14 @@ class RoomManager {
         const room = this.rooms.get(roomId);
         if (!room) return { error: 'NOT_FOUND' };
         if (room.guests.size >= 10) return { error: 'FULL' };
-        
         room.guests.set(socketId, clientId);
         this.userToRoom.set(socketId, roomId);
         room.lastActivity = Date.now();
         return room;
     }
 
-    getRoom(id) { 
-        return this.rooms.get(id); 
-    }
-    
-    getRoomByUser(socketId) { 
+    getRoom(id) { return this.rooms.get(id); }
+    getRoomByUser(socketId) {
         const id = this.userToRoom.get(socketId);
         return id ? this.rooms.get(id) : null;
     }
@@ -89,38 +71,28 @@ class RoomManager {
         let code;
         do {
             code = '';
-            for (let i = 0; i < 6; i++) {
-                code += chars[Math.floor(Math.random() * chars.length)];
-            }
+            for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
         } while (this.rooms.has(code));
         return code;
     }
 
-    // Avvia il timer di distruzione (Grace Period)
     startDestructionTimer(roomId, ioServer) {
         if (this.destructionTimeouts.has(roomId)) return;
-
         console.log(`[ROOM] ⏳ Avvio timer distruzione per ${roomId} (Host disconnesso)`);
         const timeout = setTimeout(() => {
             const room = this.rooms.get(roomId);
             if (room) {
                 console.log(`[ROOM] 💥 Stanza ${roomId} distrutta per timeout host`);
                 ioServer.to(roomId).emit('host-disconnected');
-                
-                // Pulizia completa
                 this.userToRoom.delete(room.hostId);
-                for (let guestSocketId of room.guests.keys()) {
-                    this.userToRoom.delete(guestSocketId);
-                }
+                for (let guestSocketId of room.guests.keys()) this.userToRoom.delete(guestSocketId);
                 this.rooms.delete(roomId);
                 this.destructionTimeouts.delete(roomId);
             }
-        }, 45000); // 45 secondi di tolleranza per tornare (File picker Android)
-
+        }, 45000);
         this.destructionTimeouts.set(roomId, timeout);
     }
 
-    // Annulla il timer di distruzione se l'host torna
     cancelDestructionTimer(roomId) {
         if (this.destructionTimeouts.has(roomId)) {
             clearTimeout(this.destructionTimeouts.get(roomId));
@@ -132,7 +104,7 @@ class RoomManager {
 
 const rooms = new RoomManager();
 
-// (RelayManager rimane invariato)
+// Relay Manager
 class RelayManager {
     constructor() { this.relaySessions = new Map(); }
     createSession(roomId, senderId, metadata) {
@@ -155,22 +127,17 @@ class RelayManager {
 }
 const relayManager = new RelayManager();
 
-// ============================================================
-// API REST (Invariate)
-// ============================================================
+// API
 app.get('/', (req, res) => res.json({ status: 'ok', rooms: rooms.rooms.size, uptime: process.uptime() }));
 app.get('/turn-credentials', (req, res) => {
     res.json({ iceServers: [ { urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' } ] });
 });
 
-// ============================================================
-// SOCKET.IO EVENTS (Aggiornati)
-// ============================================================
+// Socket.IO events
 io.on('connection', (socket) => {
     const clientId = socket.handshake.query.clientId;
     console.log(`[CONNECT] 🔌 Socket: ${socket.id} | ClientID: ${clientId}`);
 
-    // --- STANZE ---
     socket.on('create-room', (cb) => {
         const room = rooms.createRoom(socket.id, clientId);
         socket.join(room.id);
@@ -180,35 +147,30 @@ io.on('connection', (socket) => {
     socket.on('join-room', (roomId, cb) => {
         const result = rooms.joinRoom(roomId, socket.id, clientId);
         if (result.error) return cb({ success: false, error: result.error });
-        
         socket.join(roomId);
         socket.to(result.hostId).emit('guest-joined', { guestId: socket.id, count: result.guests.size });
-
         cb({ success: true, roomId, hostId: result.hostId, fileInfo: result.fileInfo, isHost: false });
     });
 
-    // --- RIPRISTINO SESSIONE ---
     socket.on('restore-session', ({ roomId, isHost }, cb) => {
         const room = rooms.getRoom(roomId);
-        if (!room) {
-            return cb?.({ success: false, error: 'Stanza distrutta' });
-        }
+        if (!room) return cb?.({ success: false, error: 'Stanza distrutta' });
 
         if (isHost && room.hostClientId === clientId) {
-            // L'host è tornato!
             rooms.cancelDestructionTimer(roomId);
-            
-            // Aggiorniamo il socketId dell'host
             rooms.userToRoom.delete(room.hostId);
             room.hostId = socket.id;
             rooms.userToRoom.set(socket.id, roomId);
-            
             socket.join(roomId);
             socket.to(roomId).emit('host-back');
             console.log(`[RECOVERY] ♻️ Host ripristinato nella stanza ${roomId}`);
+
+            // Invia all'host la lista dei guest attuali
+            const guestList = Array.from(room.guests.keys());
+            socket.emit('host-restored', { guests: guestList });
+
             cb?.({ success: true });
         } else if (!isHost) {
-            // Ripristino Guest
             socket.join(roomId);
             rooms.userToRoom.set(socket.id, roomId);
             room.guests.set(socket.id, clientId);
@@ -217,14 +179,8 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- STATO HOST MANUALE (Visibility API) ---
-    socket.on('host-going-away', ({ roomId }) => {
-        socket.to(roomId).emit('host-away');
-    });
-
-    socket.on('host-returned', ({ roomId }) => {
-        socket.to(roomId).emit('host-back');
-    });
+    socket.on('host-going-away', ({ roomId }) => { socket.to(roomId).emit('host-away'); });
+    socket.on('host-returned', ({ roomId }) => { socket.to(roomId).emit('host-back'); });
 
     socket.on('file-info', (info, cb) => {
         const room = rooms.getRoomByUser(socket.id);
@@ -240,9 +196,8 @@ io.on('connection', (socket) => {
         socket.to(target || room.hostId).emit('guest-ready', { guestId: socket.id });
     });
 
-    // --- SIGNALING & RELAY (Invariati) ---
     socket.on('signal', ({ to, type, data }) => socket.to(to).emit('signal', { from: socket.id, type, data }));
-    
+
     socket.on('relay-start', ({ roomId, metadata }, cb) => {
         const room = rooms.getRoom(roomId);
         if (!room || room.hostId !== socket.id) return cb?.({ error: 'NOT_HOST' });
@@ -265,18 +220,15 @@ io.on('connection', (socket) => {
         if (session) io.to(session.senderId).emit('relay-ack', { from: socket.id, index });
     });
 
-    // --- DISCONNECT (Aggiornato) ---
     socket.on('disconnect', () => {
         console.log(`[DISCONNECT] ❌ ${socket.id} (Client: ${clientId})`);
         const room = rooms.getRoomByUser(socket.id);
         if (!room) return;
 
         if (room.hostId === socket.id) {
-            // È l'host. Non distruggiamo, ma avviamo il timer
             socket.to(room.id).emit('host-away');
             rooms.startDestructionTimer(room.id, io);
         } else {
-            // È un guest. Lo rimuoviamo
             room.guests.delete(socket.id);
             rooms.userToRoom.delete(socket.id);
             io.to(room.hostId).emit('guest-left', { guestId: socket.id, remaining: room.guests.size });
