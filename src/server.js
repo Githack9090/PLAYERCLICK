@@ -166,6 +166,10 @@ io.on('connection', (socket) => {
     const clientId = socket.handshake.query.clientId;
     console.log(`[CONNECT] 🔌 ${socket.id} | client:${clientId}`);
 
+    socket.on('ping-sync', (cb) => {
+        cb(Date.now());
+    });
+
     socket.on('create-room', (cb) => {
         const room = rooms.createRoom(socket.id, clientId);
         socket.join(room.id);
