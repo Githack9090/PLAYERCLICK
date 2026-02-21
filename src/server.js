@@ -319,6 +319,7 @@ io.on('connection', (socket) => {
         } else {
             io.to(result.hostId).emit('guest-left', {
                 guestId: result.leaver,
+                clientId: clientId,
                 remaining: rooms.rooms.get(result.roomId)?.guests.size || 0
             });
         }
