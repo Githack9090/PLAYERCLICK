@@ -261,6 +261,33 @@ io.on('connection', (socket) => {
     });
 
     // ----------------------------------------------------------------
+    // SOUNDCLOUD SYNC EVENTS
+    // ----------------------------------------------------------------
+    socket.on('sc-load', ({ roomId, url }) => {
+        const room = rooms.getRoomBySocket(socket.id);
+        if (!room) return;
+        socket.to(room.id).emit('sc-load', { url });
+    });
+
+    socket.on('sc-play-command', ({ roomId, scheduledWallclock, sentAt, position, url }) => {
+        const room = rooms.getRoomBySocket(socket.id);
+        if (!room) return;
+        socket.to(room.id).emit('sc-play-command', { scheduledWallclock, sentAt, position, url });
+    });
+
+    socket.on('sc-pause', ({ roomId }) => {
+        const room = rooms.getRoomBySocket(socket.id);
+        if (!room) return;
+        socket.to(room.id).emit('sc-pause');
+    });
+
+    socket.on('mode-switch', ({ roomId, mode }) => {
+        const room = rooms.getRoomBySocket(socket.id);
+        if (!room) return;
+        socket.to(room.id).emit('mode-switch', { mode });
+    });
+
+    // ----------------------------------------------------------------
     // RELAY CHUNK (fallback quando WebRTC non disponibile)
     // ----------------------------------------------------------------
     socket.on('relay-chunk', ({ roomId, chunk, index, total, isLast }) => {
