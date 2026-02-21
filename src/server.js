@@ -32,6 +32,7 @@ class RoomManager {
             hostClientId: clientId,
             guests: new Map(),
             fileInfo: null,
+            currentMode: 'file',
             transferState: { active: false, chunkIndex: 0, totalChunks: 0, fileId: null },
             createdAt: Date.now()
         };
@@ -176,7 +177,7 @@ io.on('connection', (socket) => {
         if (result.error) return cb({ success: false, error: result.error });
         socket.join(roomId);
         socket.to(result.hostId).emit('guest-joined', { guestId: socket.id, count: result.guests.size });
-        cb({ success: true, roomId, hostId: result.hostId, fileInfo: result.fileInfo });
+        cb({ success: true, roomId, hostId: result.hostId, fileInfo: result.fileInfo, currentMode: result.currentMode||'file' });
     });
 
     socket.on('host-rejoin', ({ roomId }, cb) => {
@@ -281,9 +282,16 @@ io.on('connection', (socket) => {
         socket.to(room.id).emit('sc-pause');
     });
 
+    socket.on('stem-mode', ({ roomId, mode }) => {
+        const room = rooms.getRoomBySocket(socket.id);
+        if (!room) return;
+        socket.to(room.id).emit('stem-mode', { mode });
+    });
+
     socket.on('mode-switch', ({ roomId, mode }) => {
         const room = rooms.getRoomBySocket(socket.id);
         if (!room) return;
+        room.currentMode = mode; // persiste la modalità per i guest che entrano dopo
         socket.to(room.id).emit('mode-switch', { mode });
     });
 
